@@ -1,0 +1,103 @@
+spring:
+  application:
+    name: chatter-app
+
+  datasource:
+    url: ${CHATTER_DB_URL:jdbc:postgresql://localhost:5432/chatter}
+    username: ${CHATTER_DB_USER:chatter}
+    password: ${CHATTER_DB_PASSWORD:chatter}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+
+  jpa:
+    open-in-view: false           # lazy loading in a view layer is a latency bug waiting to happen
+    hibernate:
+      ddl-auto: validate          # Flyway owns the schema
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 100
+        order_inserts: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+  data:
+    redis:
+      host: ${CHATTER_REDIS_HOST:localhost}
+      port: ${CHATTER_REDIS_PORT:6379}
+
+  kafka:
+    bootstrap-servers: ${CHATTER_KAFKA:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+    consumer:
+      group-id: chatter-app
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+server:
+  port: ${CHATTER_APP_PORT:8080}
+  shutdown: graceful
+
+chatter:
+  cors:
+    allowed-origins: ${CHATTER_CORS_ORIGINS:http://localhost:5173}
+  internal:
+    token: ${CHATTER_INTERNAL_TOKEN:dev-internal-token-change-me}
+  contacts:
+    pepper: ${CHATTER_CONTACT_PEPPER:dev-pepper-change-me}
+  auth:
+    # Dev only: prints the OTP to the log so you can register without an SMS provider.
+    log-otp: ${CHATTER_LOG_OTP:true}
+  security:
+    jwt:
+      access-ttl: PT15M
+      issuer: chatter
+      private-key-path: ${CHATTER_JWT_KEY_PATH:}
+  outbox:
+    poll-interval-ms: 200
+  media:
+    # The browser talks to this endpoint directly with presigned URLs, so it must be reachable
+    # from the browser, not just from the app.
+    endpoint: ${CHATTER_MEDIA_ENDPOINT:http://localhost:9000}
+    region: ${CHATTER_MEDIA_REGION:us-east-1}
+    bucket: ${CHATTER_MEDIA_BUCKET:chatter-media}
+    access-key: ${CHATTER_MEDIA_ACCESS_KEY:chatter}
+    secret-key: ${CHATTER_MEDIA_SECRET_KEY:chatter123}
+
+management:
+  # Metrics and health on their own port, so Prometheus can scrape inside the network without
+  # the endpoints being public. Liveness/readiness stay on the main port as /livez and /readyz.
+  server:
+    port: ${CHATTER_MGMT_PORT:18080}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+        add-additional-paths: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        # p99 is the HLD's latency target, so these need histograms, not just averages.
+        chatter.fanout.lag: true
+        chatter.delivery.latency: true
+        http.server.requests: true
+  tracing:
+    sampling:
+      probability: ${CHATTER_TRACE_SAMPLING:0.1}
+
+logging:
+  level:
+    com.chatter: DEBUG
