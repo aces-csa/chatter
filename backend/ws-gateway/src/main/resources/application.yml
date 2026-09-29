@@ -1,0 +1,63 @@
+spring:
+  application:
+    name: chatter-ws-gateway
+
+  data:
+    redis:
+      host: ${CHATTER_REDIS_HOST:localhost}
+      port: ${CHATTER_REDIS_PORT:6379}
+
+  # Virtual threads: the gateway is a thread-per-connection shaped problem, which is exactly
+  # what Loom is for. This is the reason the project targets Java 21.
+  threads:
+    virtual:
+      enabled: true
+
+  # A rolling deploy must drain sockets, not sever them. Without this every deploy is a
+  # reconnect storm from every client at once.
+  lifecycle:
+    timeout-per-shutdown-phase: 60s
+
+server:
+  port: ${CHATTER_GATEWAY_PORT:8081}
+  shutdown: graceful
+
+chatter:
+  gateway:
+    id: ${CHATTER_GATEWAY_ID:gw-local}
+  app:
+    base-url: ${CHATTER_APP_URL:http://localhost:8080}
+  internal:
+    token: ${CHATTER_INTERNAL_TOKEN:dev-internal-token-change-me}
+  cors:
+    allowed-origins: ${CHATTER_CORS_ORIGINS:http://localhost:5173}
+  security:
+    jwk-set-uri: ${CHATTER_JWKS_URI:http://localhost:8080/.well-known/jwks.json}
+
+management:
+  # Scraped inside the network; kept off the public WebSocket port.
+  server:
+    port: ${CHATTER_GATEWAY_MGMT_PORT:18081}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+        add-additional-paths: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      gateway: ${chatter.gateway.id}
+    distribution:
+      percentiles-histogram:
+        chatter.delivery.latency: true
+  tracing:
+    sampling:
+      probability: ${CHATTER_TRACE_SAMPLING:0.1}
+
+logging:
+  level:
+    com.chatter: DEBUG
