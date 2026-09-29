@@ -1,0 +1,15 @@
+{
+  "name": "chatter-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end walkthrough: two users, real Signal keys, an encrypted message over the gateway",
+  "scripts": {
+    "test": "node walkthrough.mjs",
+    "test:groups": "node groups.mjs"
+  },
+  "dependencies": {
+    "@privacyresearch/libsignal-protocol-typescript": "^0.0.16",
+    "@stomp/stompjs": "^7.0.0",
+    "ws": "^8.18.0"
+  }
+}
