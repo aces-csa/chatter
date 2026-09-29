@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Dark is the default; light follows the operating system (FR-9.3). A WhatsApp-adjacent
+     palette without copying their exact brand values. */
+  :root {
+    color-scheme: dark;
+    --c-panel: 17 27 33;
+    --c-panel-alt: 32 44 51;
+    --c-panel-hover: 42 57 66;
+    --c-stroke: 47 59 67;
+    --c-bubble: 32 44 51;
+    --c-bubble-out: 0 92 75;
+    --c-accent: 0 168 132;
+    --c-text-primary: 233 237 239;
+    --c-text-secondary: 134 150 160;
+    --c-chat-bg: 11 20 26;
+    --wallpaper-ink: 255 255 255;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --c-panel: 255 255 255;
+      --c-panel-alt: 240 242 245;
+      --c-panel-hover: 233 237 239;
+      --c-stroke: 222 226 230;
+      --c-bubble: 255 255 255;
+      --c-bubble-out: 217 253 211;
+      --c-accent: 0 128 105;
+      --c-text-primary: 17 27 33;
+      --c-text-secondary: 84 101 111;
+      --c-chat-bg: 239 234 226;
+      --wallpaper-ink: 0 0 0;
+    }
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-chat-bg text-text-primary font-sans antialiased;
+  }
+}
+
+@layer components {
+  /* The faint doodle wash behind the message list. Rendered as a tiled SVG rather than a
+     raster so it stays crisp and costs about 400 bytes. */
+  .chat-wallpaper {
+    background-color: rgb(var(--c-chat-bg));
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='60' viewBox='0 0 60 60'%3E%3Cg fill='none' stroke='%23ffffff' stroke-opacity='0.025' stroke-width='1.2'%3E%3Ccircle cx='12' cy='12' r='5'/%3E%3Cpath d='M32 8h12v12H32z'/%3E%3Cpath d='M8 38l7 12H1z'/%3E%3Ccircle cx='44' cy='44' r='6'/%3E%3C/g%3E%3C/svg%3E");
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-text-secondary/30;
+  }
+}
