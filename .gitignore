@@ -1,0 +1,31 @@
+# Java / Maven
+target/
+!.mvn/wrapper/maven-wrapper.jar
+*.class
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# IDE
+.idea/
+*.iml
+*.iws
+.vscode/
+
+# Env & secrets
+.env
+.env.local
+*.pem
+!docker/**/*.pem
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Runtime
+logs/
+*.log

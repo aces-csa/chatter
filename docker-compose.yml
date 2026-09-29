@@ -1,0 +1,83 @@
+name: chatter
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: chatter-postgres
+    environment:
+      POSTGRES_DB: chatter
+      POSTGRES_USER: chatter
+      POSTGRES_PASSWORD: chatter
+      # deterministic collation so index behaviour matches across dev machines
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatter -d chatter"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: chatter-redis
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    ports: ["6379:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: chatter-redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --check=false
+      - --kafka-addr PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports: ["9092:9092", "9644:9644"]
+    volumes: ["redpandadata:/var/lib/redpanda/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # --- Object storage (media, step 13) ---
+  # bitnamilegacy rather than minio/minio: the official images (Docker Hub and quay.io) refuse
+  # pulls from this machine, and Bitnami moved its catalogue to bitnamilegacy in 2025.
+  # Browsers upload to it directly with presigned URLs, so port 9000 must be reachable from the
+  # browser. MinIO allows cross-origin requests from any origin by default.
+  minio:
+    image: bitnamilegacy/minio:latest
+    container_name: chatter-minio
+    environment:
+      MINIO_ROOT_USER: chatter
+      MINIO_ROOT_PASSWORD: chatter123
+      MINIO_DEFAULT_BUCKETS: chatter-media
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/bitnami/minio/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # Dev-only OTP sink. In prod this is Twilio; here every OTP lands in a web inbox
+  # at http://localhost:8025 so you can register without a phone.
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: chatter-mailhog
+    ports: ["1025:1025", "8025:8025"]
+
+volumes:
+  pgdata:
+  redisdata:
+  redpandadata:
+  miniodata:
