@@ -127,7 +127,10 @@ public class PushService {
             return;
         }
 
-        Set<UUID> muted = new java.util.HashSet<>(membership.mutedMembers(event.conversationId()));
+        // A sealed message has no conversation the server knows of, so there is no mute to look
+        // up; the notification it produces is a bare "New message" either way.
+        Set<UUID> muted = new java.util.HashSet<>(event.conversationId() == null
+                ? List.of() : membership.mutedMembers(event.conversationId()));
         // FR-4.7: a mention gets through a muted group. FR-8.4: quiet hours get through nothing.
         if (event.mentions() != null) {
             event.mentions().forEach(muted::remove);
@@ -152,16 +155,19 @@ public class PushService {
 
         byte[] payload;
         try {
-            payload = mapper.writeValueAsString(Map.of(
-                    "type", "message",
-                    "conversationId", event.conversationId(),
-                    "senderId", event.senderId(),
-                    "messageId", event.messageId())).getBytes(StandardCharsets.UTF_8);
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("type", "message");
+            // Absent for sealed messages: the server does not know them.
+            if (event.conversationId() != null) body.put("conversationId", event.conversationId());
+            if (event.senderId() != null) body.put("senderId", event.senderId());
+            body.put("messageId", event.messageId());
+            payload = mapper.writeValueAsString(body).getBytes(StandardCharsets.UTF_8);
         } catch (Exception e) {
             return;
         }
         // Topic must be URL-safe and at most 32 characters: a UUID without dashes is exactly that.
-        String topic = event.conversationId().toString().replace("-", "");
+        // Sealed pushes share one topic, so a burst of them collapses into one notification.
+        String topic = event.conversationId() == null ? "sealed" : event.conversationId().toString().replace("-", "");
 
         for (WebPushSender.Subscription subscription : subscriptionsFor(candidates.keySet())) {
             sender.send(subscription, payload, topic, TTL).whenComplete((status, error) -> {

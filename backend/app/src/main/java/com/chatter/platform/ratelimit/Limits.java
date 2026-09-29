@@ -25,6 +25,13 @@ public final class Limits {
     public static final Limit LINK_START_PER_IP = new Limit("link-start-ip", 10, Duration.ofHours(1));
     /** Polling every 2 s is 30 a minute; room for a few tabs. */
     public static final Limit LINK_CLAIM_PER_IP = new Limit("link-claim-ip", 120, Duration.ofMinutes(1));
+    /**
+     * Sealed sends carry no identity, so the address is the only per-sender handle. Generous,
+     * because a household or office shares one; the per-recipient limit is the real flood guard.
+     */
+    public static final Limit SEALED_PER_IP = new Limit("sealed-ip", 600, Duration.ofMinutes(1));
+    /** However many senders, one person cannot be sent more than this many sealed messages. */
+    public static final Limit SEALED_PER_RECIPIENT = new Limit("sealed-recipient", 300, Duration.ofMinutes(1));
 
     // Authenticated endpoints: keyed by user or device.
     public static final Limit LINK_APPROVE = new Limit("link-approve", 10, Duration.ofHours(1));

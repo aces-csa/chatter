@@ -167,6 +167,14 @@ public final class Frames {
                             String message) {
     }
 
+    /**
+     * S to C: one sealed-sender envelope for this device. Deliberately carries no sender and no
+     * conversation -- the server has neither. {@code id} is the server's row id, used only to
+     * acknowledge (and so delete) the stored copy.
+     */
+    public record Sealed(UUID id, String ciphertext, long createdAt) {
+    }
+
     /** Internal: app to a specific gateway over Redis pub/sub. Not part of the client protocol. */
     public record Delivery(UUID userId, UUID deviceId, Envelope envelope) {
     }

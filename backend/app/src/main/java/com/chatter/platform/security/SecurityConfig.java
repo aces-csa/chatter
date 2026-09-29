@@ -65,6 +65,11 @@ public class SecurityConfig {
                                 "/api/v1/auth/link/start",
                                 "/api/v1/auth/link/claim").permitAll()
                         .requestMatchers("/.well-known/jwks.json").permitAll()
+                        // Sealed sender: delivery is anonymous by design, authorised by the
+                        // recipient's unidentified access key instead of a token. The trust root
+                        // is public so a client can verify sender certificates.
+                        .requestMatchers(HttpMethod.POST, "/api/v1/sealed/deliver/*").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/sealed/trust-root").permitAll()
                         .requestMatchers("/actuator/health/**", "/livez", "/readyz").permitAll()
                         .requestMatchers(request -> request.getLocalPort() == managementPort).permitAll()
                         .anyRequest().authenticated())

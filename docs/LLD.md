@@ -466,6 +466,7 @@ public interface MessageStore {
 | `media.uploaded` | mediaId | 8 | media-worker |
 | `media.processed` | mediaId | 8 | chat-service |
 | `push.notify` | conversationId | 16 | notification-service (published by fan-out for offline devices; ids only) |
+| `sealed.created` | recipient userId | 8 | sealed fan-out (sealed sender: no conversation to key on) |
 | `<topic>.DLT` | same as source | same as source | none — parked records for inspection / replay |
 | `conversation.updated` | conversationId | 8 | fan-out worker |
 
@@ -818,6 +819,33 @@ This is exactly WhatsApp's behaviour, and it is the difference between E2EE that
 - The send path already visits every device of every member, so it records the account's full key set. The first sighting is trust-on-first-use; any key not seen before later clears `verified` and inserts a `system/identity-changed` notice (fractional `seq = lastSeq + 0.5`, never sent) into every conversation with that person. A key merely disappearing (logout) is silent.
 - A successful decrypt can add a key but never sets the baseline, so a two-device contact who messages first is not mistaken for a key change.
 - The safety number hashes the sorted concatenation of all device identity keys on each side, using the keys the sessions are bound to rather than the server's listing. `isTrustedIdentity` always returns true: libsignal throws on false, which would turn a key change into undecryptable messages.
+
+### 6A.6 Sealed sender (as built)
+
+**Server** (`sealed` module, migration V7):
+
+| Piece | Detail |
+|---|---|
+| `unidentified_access` | `user_id → access_key` (16 bytes). One per **account**, not per device: every linked device reads it (`GET /sealed/access-key`), or they would each share a different key and invalidate one another. Rotated with `PUT`. |
+| `sealed_messages` | `id, recipient_user_id, recipient_device_id, ciphertext, created_at, expires_at` (30 days). No sender, no conversation. Deleted on ack. |
+| Sender certificate | `GET /sealed/certificate`: JSON `{userId, deviceId, identityKey, expires}` signed with ECDSA P-256 (`SHA256withECDSAinP1363Format`, i.e. raw r‖s, which WebCrypto verifies natively). Separate key from the JWT key; dev key in `~/.chatter/dev-sender-cert-key.pem`. Trust root public at `GET /sealed/trust-root`. |
+| `POST /sealed/deliver/{userId}` | **Public.** Header `Unidentified-Access-Key`, constant-time compare; a wrong key and an unknown user get the same 401 `UNIDENTIFIED_ACCESS_DENIED`. Targets must be exactly the recipient's keyed devices, else 409 `DEVICES_CHANGED`. Limits: per source IP and per recipient (there is no sender to key on). |
+| `POST /sealed/self` | Authenticated copy to the sender's own other devices; the server knows who you are when you talk to yourself, and needs to, to leave the sending device out of the required set. |
+| `GET /sealed/messages`, `POST /sealed/messages/ack` | Catch-up and deletion, scoped to the calling device. |
+| Delivery | Rows + outbox event in one transaction → `sealed.created` (keyed by **recipient**) → `chatter-sealed-fanout` → `SEALED` frame to online devices, and a `push.notify` job with null sender and conversation for the rest ("New message"). DLT: `sealed.created.DLT`. |
+
+**Envelope** (per recipient device, base64 of JSON):
+```
+e  = ephemeral X25519 public key (libsignal 33-byte form)
+k  = HKDF-SHA256(ECDH(e, recipientIdentity), salt = e ‖ recipientIdentity, info = "ChatterSealedSender v1")
+c  = AES-256-GCM_k(iv, aad = e, { certificate, signature, type, body })   // body = Signal ciphertext
+```
+
+**Receive checks, in order:** open the envelope with our identity key → verify the certificate against the pinned trust root (build-time `VITE_SEALED_TRUST_ROOT`, else trust on first use) → expiry against the *server's* delivery time → drop if the sender is blocked → Signal-decrypt with the certificate's device session → require `session identity key == certificate identity key` → require the inner `conversationId` to be a DIRECT chat the sender is in. A decrypt failure after a valid unseal still yields the usual "Waiting for this message" placeholder, since the sender is known.
+
+**Client rules.** A message goes sealed when the chat is DIRECT, it has no attachment, and we hold the peer's access key (learned from any message they send us, where it rides inside the encryption). Otherwise, or on 401, it goes identified, which is still end-to-end encrypted. Sealed rows get `messageId = clientMessageId` and `seq = lastSeq + 0.5`, like other unsequenced rows, and a client-computed disappearing expiry. Receipts for sealed messages are sealed `receipt` controls listing message ids; `READ` obeys the read-receipts setting, which is reciprocal.
+
+**Known limits.** Typing indicators and presence still name the conversation. Message info has no server data for sealed messages. Edit/delete time windows are enforced by clients only on this path. The notification for a sealed message cannot name the chat, and mute cannot apply to it while the page is closed.
 
 ---
 
