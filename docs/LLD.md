@@ -461,14 +461,17 @@ public interface MessageStore {
 
 | Topic | Key | Partitions | Consumer |
 |---|---|---|---|
-| `message.created` | conversationId | 32 | fan-out worker, notification-service |
+| `message.created` | conversationId | 32 | fan-out worker |
 | `message.delivered` | conversationId | 16 | chat-service (receipt propagation) |
 | `media.uploaded` | mediaId | 8 | media-worker |
 | `media.processed` | mediaId | 8 | chat-service |
-| `push.notify` | userId | 16 | notification-service |
+| `push.notify` | conversationId | 16 | notification-service (published by fan-out for offline devices; ids only) |
+| `<topic>.DLT` | same as source | same as source | none — parked records for inspection / replay |
 | `conversation.updated` | conversationId | 8 | fan-out worker |
 
 Keying by `conversationId` is what preserves per-conversation ordering through the bus — the same invariant DD-2 establishes in the database.
+
+**Failure handling.** One shared `DefaultErrorHandler` serves every listener: 3 blocking retries with exponential backoff (0.5 s → 1 s → 2 s), then the record goes to `<topic>.DLT` on the **same partition**, with the exception and original offset in its headers. Parse failures skip the retries. Retries block the partition on purpose, because skipping ahead would reorder a conversation. Dead-lettering `message.created` loses nothing: the message is already in Postgres and the inbox, so devices get it on their next SYNC. Counter: `chatter.kafka.dead_lettered{topic}`.
 
 ---
 

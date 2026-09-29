@@ -31,8 +31,10 @@ import java.util.UUID;
  * the names already stored on the device, so the notification is readable without the server
  * ever learning, or sending through a third-party push service, anything more than routing data.
  *
- * <p>Consumes message.created on its own consumer group, so a slow push service can never hold
- * up live delivery on the fan-out group.
+ * <p>Consumes {@code push.notify}, which fan-out publishes for the devices that were offline when
+ * it delivered. The job carries ids only, so this consumer never reads the heavy message event, and
+ * a slow push service backs up only its own topic -- never live delivery. A job that keeps failing
+ * lands on {@code push.notify.DLT} (see the shared Kafka error handler).
  */
 @Service
 public class PushService {
@@ -67,12 +69,12 @@ public class PushService {
         this.metrics = metrics;
     }
 
-    /** The subset of chat's MessageCreatedEvent this module needs; chat's type is not ours to import. */
+    /** The push.notify job as this module reads it; chat's type is not ours to import. */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record MessageCreated(UUID messageId, UUID conversationId, UUID senderId, String encoding,
-                          List<Target> targets, boolean silent, List<UUID> mentions) {
+    record PushNotify(UUID messageId, UUID conversationId, UUID senderId, long createdAt,
+                      List<UUID> mentions, List<Device> devices) {
         @JsonIgnoreProperties(ignoreUnknown = true)
-        record Target(UUID userId, UUID deviceId) {
+        record Device(UUID userId, UUID deviceId) {
         }
     }
 
@@ -111,18 +113,17 @@ public class PushService {
         jdbc.update("DELETE FROM push_subscriptions WHERE device_id = ? AND endpoint = ?", deviceId, endpoint);
     }
 
-    @KafkaListener(topics = KafkaTopicsConfig.MESSAGE_CREATED, groupId = "chatter-push", concurrency = "2")
-    public void onMessageCreated(String rawEvent) {
-        MessageCreated event;
-        try {
-            event = mapper.readValue(rawEvent, MessageCreated.class);
-        } catch (Exception e) {
-            log.warn("Cannot read message.created for push; skipping", e);
+    @KafkaListener(topics = KafkaTopicsConfig.PUSH_NOTIFY, groupId = "chatter-push", concurrency = "2")
+    public void onPushNotify(String rawEvent) throws com.fasterxml.jackson.core.JsonProcessingException {
+        // Unreadable jobs throw straight to push.notify.DLT; transient failures are retried first.
+        PushNotify event = mapper.readValue(rawEvent, PushNotify.class);
+        if (event.devices() == null || event.devices().isEmpty()) {
             return;
         }
-        // Timeline events ("X added Y") are not worth waking someone for.
-        // Reactions, edits and deletes arrive silently; so do timeline events.
-        if (event.silent() || "system/v1".equals(event.encoding()) || event.targets() == null) {
+        // A job that sat in a backlog (or was replayed from the DLT) past the push TTL is stale:
+        // the push service would drop it anyway, and the user has likely opened the chat since.
+        if (System.currentTimeMillis() - event.createdAt() > TTL.toMillis()) {
+            metrics.counter("chatter.push.sent", "outcome", "expired").increment();
             return;
         }
 
@@ -131,18 +132,19 @@ public class PushService {
         if (event.mentions() != null) {
             event.mentions().forEach(muted::remove);
         }
-        muted.addAll(privacy.inQuietHours(event.targets().stream().map(MessageCreated.Target::userId).distinct().toList(),
+        muted.addAll(privacy.inQuietHours(event.devices().stream().map(PushNotify.Device::userId).distinct().toList(),
                 java.time.Instant.now()));
         Map<UUID, UUID> candidates = new HashMap<>();
-        for (MessageCreated.Target target : event.targets()) {
-            // Never notify people about their own messages on their other devices.
-            if (!target.userId().equals(event.senderId()) && !muted.contains(target.userId())) {
-                candidates.put(target.deviceId(), target.userId());
+        for (PushNotify.Device device : event.devices()) {
+            if (!muted.contains(device.userId())) {
+                candidates.put(device.deviceId(), device.userId());
             }
         }
         if (candidates.isEmpty()) {
             return;
         }
+        // Fan-out saw these devices offline; one may have reconnected while the job was queued,
+        // and it already has the message.
         candidates.keySet().removeAll(delivery.onlineDevices(candidates));
         if (candidates.isEmpty()) {
             return;
