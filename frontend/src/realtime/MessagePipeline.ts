@@ -14,14 +14,17 @@ import { encryptedSizeOf, newMediaKey } from '@/lib/media/mediaCrypto';
 import { mediaPreview } from '@/lib/media/labels';
 import type { PreparedMedia } from '@/lib/media/prepare';
 import { localBlobId } from './MediaUploads';
-import { api } from '@/lib/api';
+import { api, type SealedTarget } from '@/lib/api';
+import { sealedSender } from '@/lib/crypto/SealedSender';
+import { blockedIds } from '@/lib/blocks';
+import { readReceiptsEnabled } from '@/lib/quietHours';
 import { base64ToBuffer, bufferToUtf8 } from '@/lib/bytes';
 import { crypto } from '@/lib/crypto/LibsignalProvider';
 import { identityTrust } from '@/lib/crypto/IdentityTrust';
 import { senderKeys, type SenderKeyDistribution } from '@/lib/crypto/SenderKeys';
 import { refreshGroupDetails, saveConversation } from '@/db/conversations';
 import { removesSomeone, type GroupEvent } from '@/lib/groupEvents';
-import type { MessagePayload, RecipientPayload } from './envelope';
+import type { MessagePayload, RecipientPayload, SealedPayload } from './envelope';
 
 /** The plaintext that goes inside the ciphertext. The server never sees any of this. */
 interface InnerPayload {
@@ -37,14 +40,45 @@ interface InnerPayload {
    * sequenced, synced and delivered to every device like any other, then applied rather than
    * rendered. Absent for a normal message.
    */
-  kind?: 'reaction' | 'edit' | 'delete' | 'location';
+  kind?: 'reaction' | 'edit' | 'delete' | 'location' | 'receipt';
   targetId?: string;
   /** A shared location (a message), or its latest position (a 'location' control). */
   location?: LocationInfo;
   mentions?: string[];
   /** Reaction emoji; empty string removes the reaction. */
   emoji?: string;
+  /**
+   * DIRECT chats: the sender's unidentified access key, so the peer can send to them sealed.
+   * Shared only inside end-to-end encryption, which is what keeps strangers off the sealed path.
+   */
+  accessKey?: string;
+  /**
+   * Sealed messages only. The server assigns no id and files the message under no conversation,
+   * so both travel inside: the id is the sender's clientMessageId, and the conversation is
+   * checked against the certificate's sender rather than trusted.
+   */
+  messageId?: string;
+  conversationId?: string;
+  /** Sealed receipts: the messages this receipt covers. */
+  receipt?: 'DELIVERED' | 'READ';
+  messageIds?: string[];
 }
+
+/** One sealed send: the peer's devices anonymously, and our own other devices identified. */
+export interface SealedPlan {
+  recipientUserId: string;
+  accessKey: string;
+  peerTargets: SealedTarget[];
+  selfTargets: SealedTarget[];
+}
+
+/** What arrived in a sealed envelope, for the caller's follow-up (receipt, notification). */
+export type SealedOutcome =
+  | { kind: 'message'; senderId: string; conversationId: string; messageId: string; discovered: boolean }
+  | { kind: 'control' | 'receipt' | 'dropped' };
+
+/** Sealed rows sit between server-sequenced ones: after lastSeq, ordered among themselves by time. */
+const SEALED_SEQ_OFFSET = 0.5;
 
 export interface ComposeOptions {
   replyTo?: ReplyRef;
@@ -317,18 +351,8 @@ export class MessagePipeline {
       throw new Error(`Unknown conversation ${message.conversationId}`);
     }
     const control = message.control;
-    const inner: InnerPayload = control
-      ? innerFromControl(control, message.createdAt)
-      : {
-          contentType: message.contentType,
-          body: message.body,
-          sentAt: message.createdAt,
-          media: message.media,
-          replyTo: message.replyTo,
-          forwarded: message.forwarded,
-          location: message.location,
-          mentions: message.mentions,
-        };
+    const inner = innerFor(message);
+    if (conversation.type === 'DIRECT') inner.accessKey = await sealedSender.ownAccessKey();
     const serialised = JSON.stringify(inner);
 
     const plan: SendPlan =
@@ -356,6 +380,246 @@ export class MessagePipeline {
     }
     const row = await db.messages.get(clientMessageId);
     if (row?.control) await db.messages.delete(clientMessageId);
+  }
+
+  /**
+   * The sealed version of a send, or null when this message must go identified:
+   * <ul>
+   *   <li>groups -- a group message names its conversation, and so its members, by design;</li>
+   *   <li>attachments -- the upload is already tied to the conversation on the server;</li>
+   *   <li>no access key yet -- the peer has not messaged us since we last learned it.</li>
+   * </ul>
+   * The first message of a new chat is therefore identified, and carries our key; from the
+   * peer's first reply on, both directions go sealed.
+   */
+  async buildSealedPlan(clientMessageId: string): Promise<SealedPlan | null> {
+    const message = await db.messages.get(clientMessageId);
+    if (!message || message.media) return null;
+    const conversation = await db.conversations.get(message.conversationId);
+    if (!conversation || conversation.type !== 'DIRECT') return null;
+    const peer = conversation.participantIds.find((id) => id !== this.selfUserId);
+    if (!peer) return null;
+    const accessKey = await sealedSender.peerAccessKey(peer);
+    if (!accessKey) return null;
+
+    const inner = innerFor(message);
+    inner.accessKey = await sealedSender.ownAccessKey();
+    inner.messageId = clientMessageId;
+    inner.conversationId = conversation.id;
+    const serialised = JSON.stringify(inner);
+    return {
+      recipientUserId: peer,
+      accessKey,
+      peerTargets: await this.sealFor(peer, serialised),
+      selfTargets: await this.sealFor(this.selfUserId, serialised),
+    };
+  }
+
+  /** A sealed DELIVERED or READ for messages a peer sent us sealed. Null if we cannot reach them sealed. */
+  async buildSealedReceipt(
+    conversationId: string,
+    peer: string,
+    state: 'DELIVERED' | 'READ',
+    messageIds: string[],
+  ): Promise<SealedPlan | null> {
+    const accessKey = await sealedSender.peerAccessKey(peer);
+    if (!accessKey || messageIds.length === 0) return null;
+    const inner: InnerPayload = {
+      kind: 'receipt',
+      receipt: state,
+      messageIds,
+      conversationId,
+      accessKey: await sealedSender.ownAccessKey(),
+      contentType: 'text/plain',
+      body: '',
+      sentAt: Date.now(),
+    };
+    return { recipientUserId: peer, accessKey, peerTargets: await this.sealFor(peer, JSON.stringify(inner)), selfTargets: [] };
+  }
+
+  /** Signal-encrypts to each device of an account, then seals each ciphertext to that device. */
+  private async sealFor(userId: string, serialised: string): Promise<SealedTarget[]> {
+    const certificate = await sealedSender.certificate();
+    const targets: SealedTarget[] = [];
+    for (const device of await this.ensureSessions(userId)) {
+      const { cipherType, ciphertext } = await crypto.encrypt(device.deviceId, serialised);
+      targets.push({
+        deviceId: device.deviceId,
+        ciphertext: await sealedSender.seal(device.identityKey, certificate, cipherType, ciphertext),
+      });
+    }
+    return targets;
+  }
+
+  /**
+   * The sealed send went through. There is no server id or sequence number: the message keeps
+   * its clientMessageId as its id -- the same id the recipients stored -- and sorts after the
+   * last sequenced message.
+   */
+  async onSealedSent(clientMessageId: string): Promise<void> {
+    await this.onAcked(clientMessageId);
+    await db.transaction('rw', db.messages, db.outbox, db.conversations, async () => {
+      const message = await db.messages.get(clientMessageId);
+      await db.outbox.delete(clientMessageId);
+      if (!message) return; // a control row, already removed by onAcked
+      const conversation = await db.conversations.get(message.conversationId);
+      await db.messages.update(clientMessageId, {
+        messageId: clientMessageId,
+        seq: (conversation?.lastSeq ?? 0) + SEALED_SEQ_OFFSET,
+        state: 'SENT',
+        sealed: true,
+        expiresAt: expiryFor(conversation, message.createdAt),
+      });
+    });
+  }
+
+  /**
+   * Opens a sealed envelope and stores what it carries. Everything the identified path gets from
+   * the server -- sender, conversation, id -- comes from inside, and each is checked:
+   * the certificate from the server's signature, the sender from the Signal session that
+   * decrypted it, and the conversation from being a 1:1 chat that sender is actually in.
+   */
+  async receiveSealed(frame: SealedPayload): Promise<SealedOutcome> {
+    let unsealed;
+    try {
+      unsealed = await sealedSender.unseal(frame.ciphertext, frame.createdAt);
+    } catch (error) {
+      // Not for us, tampered with, or a forged certificate: there is no trustworthy sender to
+      // attribute anything to, so there is nothing to show.
+      console.warn('[sealed] cannot open envelope', frame.id, error);
+      return { kind: 'dropped' };
+    }
+    if ((await blockedIds()).includes(unsealed.senderUserId)) {
+      // The server could not refuse it -- it did not know who sent it. We can.
+      return { kind: 'dropped' };
+    }
+
+    const sender = unsealed.senderUserId;
+    let inner: InnerPayload;
+    try {
+      const plaintext = await crypto.decrypt(unsealed.senderDeviceId, unsealed.cipherType, unsealed.ciphertext);
+      inner = JSON.parse(plaintext) as InnerPayload;
+    } catch (error) {
+      // A ratchet desync, as on the identified path. The envelope told us who it is from, so the
+      // user gets the same recoverable placeholder in that chat instead of a silent gap.
+      console.warn('[sealed] cannot decrypt inner message', frame.id, error);
+      await this.storeSealedPlaceholder(frame, sender);
+      return { kind: 'dropped' };
+    }
+    // The certificate names a sender; the session proves it. A valid certificate wrapped around
+    // a ciphertext from some other session would have failed to decrypt; this catches a
+    // certificate for a key the session was never bound to.
+    if ((await crypto.remoteIdentityKey(unsealed.senderDeviceId)) !== unsealed.identityKey) {
+      console.warn('[sealed] certificate does not match the session identity; dropping');
+      return { kind: 'dropped' };
+    }
+    const senderIdentity = unsealed.identityKey;
+
+    if (sender !== this.selfUserId) {
+      await identityTrust
+        .observeDevice(sender, senderIdentity)
+        .catch((error) => console.warn('[trust] could not record identity key', error));
+      await sealedSender.rememberPeerAccessKey(sender, inner.accessKey);
+    }
+
+    if (!inner.conversationId) return { kind: 'dropped' };
+    const discovered = await this.ensureConversationKnown(inner.conversationId);
+    const conversation = await db.conversations.get(inner.conversationId);
+    if (!conversation || conversation.type !== 'DIRECT' || !conversation.participantIds.includes(sender)) {
+      console.warn('[sealed] message names a conversation its sender is not in; dropping');
+      return { kind: 'dropped' };
+    }
+
+    if (inner.kind === 'receipt') {
+      if (sender !== this.selfUserId && inner.receipt && inner.messageIds) {
+        await this.applySealedReceipt(conversation.id, inner.receipt, inner.messageIds);
+      }
+      return { kind: 'receipt' };
+    }
+    if (inner.kind) {
+      await this.applyControl(conversation.id, sender, inner);
+      return { kind: 'control' };
+    }
+
+    const messageId = inner.messageId ?? frame.id;
+    if (await db.messages.where('messageId').equals(messageId).first()) return { kind: 'dropped' };
+    // Our own message from another of our devices: this device may be the one that sent it.
+    if (await db.messages.get(messageId)) return { kind: 'dropped' };
+
+    const ours = sender === this.selfUserId;
+    await db.transaction('rw', db.messages, db.conversations, async () => {
+      const current = await db.conversations.get(conversation.id);
+      await db.messages.put({
+        clientMessageId: messageId,
+        messageId,
+        conversationId: conversation.id,
+        senderId: sender,
+        seq: (current?.lastSeq ?? 0) + SEALED_SEQ_OFFSET,
+        body: inner.body,
+        contentType: inner.contentType,
+        state: ours ? 'SENT' : 'DELIVERED',
+        sealed: true,
+        createdAt: frame.createdAt,
+        expiresAt: expiryFor(current, frame.createdAt),
+        replyTo: inner.replyTo,
+        forwarded: inner.forwarded,
+        location: inner.location,
+        mentions: inner.mentions,
+      });
+      if (current) {
+        await db.conversations.update(conversation.id, {
+          lastMessageAt: frame.createdAt,
+          lastMessagePreview: inner.location ? locationPreview(inner.location) : inner.body,
+          unreadCount: current.unreadCount + (ours ? 0 : 1),
+        });
+      }
+    });
+    return { kind: 'message', senderId: sender, conversationId: conversation.id, messageId, discovered };
+  }
+
+  /** "Waiting for this message" in the 1:1 chat with the sender, when a sealed message will not decrypt. */
+  private async storeSealedPlaceholder(frame: SealedPayload, sender: string): Promise<void> {
+    if (sender === this.selfUserId) return;
+    const conversation = await db.conversations
+      .filter((c) => c.type === 'DIRECT' && c.participantIds.includes(sender))
+      .first();
+    if (!conversation || (await db.messages.get(frame.id))) return;
+    await db.transaction('rw', db.messages, db.conversations, async () => {
+      await db.messages.put({
+        clientMessageId: frame.id,
+        messageId: frame.id,
+        conversationId: conversation.id,
+        senderId: sender,
+        seq: conversation.lastSeq + SEALED_SEQ_OFFSET,
+        body: '',
+        contentType: 'text/plain',
+        state: 'DELIVERED',
+        undecryptable: true,
+        sealed: true,
+        createdAt: frame.createdAt,
+      });
+      await db.conversations.update(conversation.id, {
+        lastMessageAt: frame.createdAt,
+        lastMessagePreview: 'Waiting for this message',
+        unreadCount: conversation.unreadCount + 1,
+      });
+    });
+  }
+
+  /** A peer's sealed receipt: our messages it names move forward, never back. */
+  private async applySealedReceipt(conversationId: string, receipt: 'DELIVERED' | 'READ', messageIds: string[]): Promise<void> {
+    // Read receipts are reciprocal (FR-2.3): with ours off, theirs show as delivered only.
+    const state = receipt === 'READ' && !(await readReceiptsEnabled()) ? 'DELIVERED' : receipt;
+    const rank = { SENT: 0, DELIVERED: 1, READ: 2 } as const;
+    const ids = new Set(messageIds);
+    await db.messages
+      .where('conversationId')
+      .equals(conversationId)
+      .filter((m) => !!m.messageId && ids.has(m.messageId))
+      .modify((message) => {
+        if (message.senderId !== this.selfUserId || message.state === 'PENDING' || message.state === 'FAILED') return;
+        if (rank[state] > rank[message.state as keyof typeof rank]) message.state = state;
+      });
   }
 
   /** A rejected send may mean our device list is stale; look again next time. */
@@ -514,6 +778,9 @@ export class MessagePipeline {
 
     try {
       const inner = JSON.parse(await this.decryptContent(frame)) as InnerPayload;
+      if (frame.senderId !== this.selfUserId) {
+        await sealedSender.rememberPeerAccessKey(frame.senderId, inner.accessKey);
+      }
       if (inner.kind) {
         // A reaction, edit or delete: applied to its target, never shown as a bubble. The
         // sequence still advances, or the next SYNC would ask for it again forever.
@@ -773,6 +1040,27 @@ export class MessagePipeline {
       return false;
     }
   }
+}
+
+/** The plaintext for a stored outgoing row, message or control. */
+function innerFor(message: LocalMessage): InnerPayload {
+  return message.control
+    ? innerFromControl(message.control, message.createdAt)
+    : {
+        contentType: message.contentType,
+        body: message.body,
+        sentAt: message.createdAt,
+        media: message.media,
+        replyTo: message.replyTo,
+        forwarded: message.forwarded,
+        location: message.location,
+        mentions: message.mentions,
+      };
+}
+
+/** Disappearing messages for sealed rows, which get no server-computed expiry. */
+function expiryFor(conversation: LocalConversation | undefined, createdAt: number): number | undefined {
+  return conversation?.disappearingSeconds ? createdAt + conversation.disappearingSeconds * 1000 : undefined;
 }
 
 /** The encrypted payload a control message carries, for sending and for applying locally. */

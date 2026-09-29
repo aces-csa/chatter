@@ -26,6 +26,12 @@ export interface UserDto {
   avatar?: string;
 }
 
+/** One sealed envelope for one recipient device. */
+export interface SealedTarget {
+  deviceId: string;
+  ciphertext: string;
+}
+
 export type Audience = 'everyone' | 'contacts' | 'nobody';
 
 export interface PrivacySettings {
@@ -307,6 +313,46 @@ export const api = {
     request<{ url: string; expiresAt: string }>(`/api/v1/media/${mediaId}/url`),
 
   iceServers: () => request<RTCIceServer[]>('/api/v1/calls/ice-servers'),
+
+  // --- Sealed sender -------------------------------------------------------------------------
+  senderCertificate: () =>
+    request<{ certificate: string; signature: string; expiresAt: number }>('/api/v1/sealed/certificate'),
+
+  sealedTrustRoot: () => request<{ publicKey: string }>('/api/v1/sealed/trust-root'),
+
+  ownAccessKey: () => request<{ accessKey: string }>('/api/v1/sealed/access-key'),
+
+  setOwnAccessKey: (accessKey: string) =>
+    request<void>('/api/v1/sealed/access-key', { method: 'PUT', body: JSON.stringify({ accessKey }) }),
+
+  /**
+   * The anonymous send. Deliberately bypasses {@link request}: that attaches our access token,
+   * and a token would tell the server exactly who is sending -- the one thing this must not do.
+   * No cookies either (credentials: 'omit'); the access key header is the only authorisation.
+   */
+  sealedDeliver: async (recipientUserId: string, accessKey: string, targets: SealedTarget[]): Promise<{ createdAt: number }> => {
+    const response = await fetch(`/api/v1/sealed/deliver/${recipientUserId}`, {
+      method: 'POST',
+      credentials: 'omit',
+      headers: { 'Content-Type': 'application/json', 'Unidentified-Access-Key': accessKey },
+      body: JSON.stringify({ targets }),
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as ApiErrorBody | null;
+      throw new ApiError(body?.code ?? 'INTERNAL', body?.message ?? `Request failed with ${response.status}`,
+        body?.retryable ?? false, response.status);
+    }
+    return (await response.json()) as { createdAt: number };
+  },
+
+  /** The copy for our own other devices. Identified: the server knows who we are when we talk to ourselves. */
+  sealedToSelf: (targets: SealedTarget[]) =>
+    request<{ createdAt: number }>('/api/v1/sealed/self', { method: 'POST', body: JSON.stringify({ targets }) }),
+
+  pendingSealed: () => request<Array<{ id: string; ciphertext: string; createdAt: number }>>('/api/v1/sealed/messages'),
+
+  ackSealed: (ids: string[]) =>
+    request<void>('/api/v1/sealed/messages/ack', { method: 'POST', body: JSON.stringify({ ids }) }),
 
   vapidPublicKey: () => request<{ publicKey: string }>('/api/v1/push/vapid-public-key'),
 

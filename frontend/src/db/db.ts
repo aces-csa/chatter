@@ -135,6 +135,13 @@ export interface LocalMessage {
   location?: LocationInfo;
   /** FR-4.7: user ids @mentioned in the text. */
   mentions?: string[];
+  /**
+   * Sent or received through sealed sender: no server sequence number or record, so its id is the
+   * sender's clientMessageId and receipts for it travel sealed, device to device.
+   */
+  sealed?: boolean;
+  /** Sealed incoming messages: the furthest receipt we have sent back for it. */
+  receiptSent?: 'DELIVERED' | 'READ';
   /** Groups: each member's furthest receipt for this message, so ticks turn blue only when all have read. */
   receipts?: Record<string, 'DELIVERED' | 'READ'>;
 }

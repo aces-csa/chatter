@@ -1,8 +1,11 @@
-import { db, getMeta, setMeta, type LocalConversation } from '@/db/db';
+import { db, setMeta, type LocalConversation } from '@/db/db';
 import { api } from '@/lib/api';
 import { realtimeService } from '@/realtime/RealtimeService';
+import { sealedSender } from '@/lib/crypto/SealedSender';
+import { BLOCKED_KEY, blockedIds } from '@/lib/blocks';
 
-const BLOCKED_KEY = 'blockedUserIds';
+export { blockedIds };
+
 
 /** Pin (max 3), archive, mark unread (FR-7.2 / 7.3). Server-side, so other devices agree. */
 export async function setChatState(
@@ -58,12 +61,12 @@ export async function loadBlocks(): Promise<string[]> {
   return ids;
 }
 
-export async function blockedIds(): Promise<string[]> {
-  return (await getMeta<string[]>(BLOCKED_KEY)) ?? [];
-}
 
 export async function setBlocked(userId: string, blocked: boolean): Promise<void> {
   await (blocked ? api.block(userId) : api.unblock(userId));
+  // They hold our access key, so they could still send to us sealed, where the server cannot
+  // see who is sending and cannot refuse. A new key sends them back to identified sends.
+  if (blocked) await sealedSender.rotateAccessKey().catch((error) => console.warn('[sealed] key rotation failed', error));
   const current = await blockedIds();
   await setMeta(BLOCKED_KEY, blocked ? [...new Set([...current, userId])] : current.filter((id) => id !== userId));
 }
