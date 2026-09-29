@@ -14,7 +14,8 @@ export type EnvelopeType =
   | 'CONV_UPDATE'
   | 'ERROR'
   | 'CALL_EVENT'
-  | 'CALL_SIGNAL';
+  | 'CALL_SIGNAL'
+  | 'SEALED';
 
 export interface Envelope<P = unknown> {
   v: number;
@@ -114,4 +115,11 @@ export interface ConnectOkPayload {
 
 export function envelope<P>(type: EnvelopeType, payload: P): Envelope<P> {
   return { v: 1, type, ts: Date.now(), payload };
+}
+
+/** A sealed-sender envelope: no sender, no conversation. {@code id} is only for acknowledging it. */
+export interface SealedPayload {
+  id: string;
+  ciphertext: string;
+  createdAt: number;
 }

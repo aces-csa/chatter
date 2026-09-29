@@ -18,3 +18,12 @@ export async function inQuietHours(now = new Date()): Promise<boolean> {
     ? minute >= p.quietStart && minute < p.quietEnd
     : minute >= p.quietStart || minute < p.quietEnd;
 }
+
+/**
+ * Read receipts setting, from the cached privacy settings. Sealed receipts go device to device,
+ * so the client applies the rule the server applies to identified ones: off means we neither
+ * send them nor show them (reciprocal, FR-2.3).
+ */
+export async function readReceiptsEnabled(): Promise<boolean> {
+  return (await getMeta<PrivacySettings>(PRIVACY_KEY))?.readReceipts ?? true;
+}

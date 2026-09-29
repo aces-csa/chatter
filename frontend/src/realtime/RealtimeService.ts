@@ -1,5 +1,7 @@
 import { db, getMeta, setMeta } from '@/db/db';
-import { api } from '@/lib/api';
+import { api, ApiError } from '@/lib/api';
+import { sealedSender } from '@/lib/crypto/SealedSender';
+import { readReceiptsEnabled } from '@/lib/quietHours';
 import { crypto } from '@/lib/crypto/LibsignalProvider';
 import {
   DELETE_FOR_EVERYONE_WINDOW_MS,
@@ -7,6 +9,7 @@ import {
   MessagePipeline,
   PENDING_SEQ,
   type ComposeOptions,
+  type SealedPlan,
 } from './MessagePipeline';
 import type { LocalMessage, LocationInfo } from '@/db/db';
 import { LiveLocationTracker } from './LiveLocation';
@@ -29,6 +32,7 @@ import {
   type NackPayload,
   type PresencePayload,
   type ReceiptPayload,
+  type SealedPayload,
   type SyncPagePayload,
   type TypingFromPayload,
 } from './envelope';
@@ -76,6 +80,7 @@ export class RealtimeService {
     this.unsubscribers = [
       realtime.on('CONNECT_OK', (frame) => void this.onConnected(frame as Envelope<ConnectOkPayload>)),
       realtime.on('MESSAGE', (frame) => void this.onMessage(frame as Envelope<MessagePayload>)),
+      realtime.on('SEALED', (frame) => void this.processSealed([(frame as Envelope<SealedPayload>).payload], true)),
       realtime.on('SYNC_PAGE', (frame) => void this.onSyncPage(frame as Envelope<SyncPagePayload>)),
       realtime.on('ACK', (frame) => void this.onAck(frame as Envelope<AckPayload>)),
       realtime.on('NACK', (frame) => void this.onNack(frame as Envelope<NackPayload>)),
@@ -280,7 +285,11 @@ export class RealtimeService {
   private async onConnected(frame: Envelope<ConnectOkPayload>): Promise<void> {
     console.info('[realtime] connected as device', frame.payload.deviceId);
     await this.topUpPreKeysIfLow();
+    // Every connect, so a key rotated on another of our devices reaches this one before it is
+    // shared again in an outgoing message.
+    await sealedSender.refreshOwnAccessKey().catch((error) => console.warn('[sealed] access key refresh failed', error));
     await this.requestSync();
+    await this.drainSealed();
     await this.subscribeToPresence();
     await this.flushOutbox();
     await this.sendPendingReplies();
@@ -371,6 +380,128 @@ export class RealtimeService {
         uptoSeq: payload.seq,
       }),
     );
+  }
+
+  // --- Sealed sender ---------------------------------------------------------------------------
+
+  /** Sealed envelopes stored while we were away. They are not part of SYNC: they have no sequence. */
+  private async drainSealed(): Promise<void> {
+    try {
+      const pending = await api.pendingSealed();
+      if (pending.length > 0) await this.processSealed(pending, false);
+    } catch (error) {
+      console.warn('[sealed] could not fetch pending sealed messages', error);
+    }
+  }
+
+  /**
+   * Opens, stores and acknowledges sealed envelopes, then sends each sender one sealed DELIVERED
+   * receipt covering everything of theirs in the batch.
+   *
+   * <p>Acknowledging deletes the server's copy, so it happens only after the message is stored.
+   * Crash in between and the envelope comes again; its Signal message key is already spent, it
+   * fails to decrypt, and the stored copy stands.
+   */
+  private async processSealed(items: SealedPayload[], live: boolean): Promise<void> {
+    const pipeline = this.pipeline;
+    if (!pipeline) return;
+    const handled: string[] = [];
+    const bySender = new Map<string, { conversationId: string; messageIds: string[] }>();
+    let discovered = false;
+
+    for (const item of items) {
+      const outcome = await pipeline.receiveSealed(item).catch((error) => {
+        console.warn('[sealed] receive failed', error);
+        return null;
+      });
+      if (!outcome) continue; // unexpected failure: leave it on the server and try again later
+      handled.push(item.id);
+      if (outcome.kind !== 'message') continue;
+      discovered = discovered || outcome.discovered;
+      if (outcome.senderId === this.selfUserId) continue;
+
+      usePresenceStore.getState().setTyping(outcome.conversationId, outcome.senderId, null);
+      const group = bySender.get(outcome.senderId) ?? { conversationId: outcome.conversationId, messageIds: [] };
+      group.messageIds.push(outcome.messageId);
+      bySender.set(outcome.senderId, group);
+      if (live) {
+        const stored = await db.messages.get(outcome.messageId);
+        if (stored) {
+          void notifyIncoming(stored, useUiStore.getState().activeConversationId, this.selfUserId).catch((error) =>
+            console.debug('[notify] skipped', error),
+          );
+        }
+      }
+    }
+
+    if (handled.length > 0) {
+      await api.ackSealed(handled).catch((error) => console.warn('[sealed] ack failed; will be redelivered', error));
+    }
+    for (const [senderId, group] of bySender) {
+      await this.sendSealedReceipt(group.conversationId, senderId, 'DELIVERED', group.messageIds);
+    }
+    if (discovered) await this.subscribeToPresence();
+  }
+
+  /**
+   * Best effort, like a live identified receipt: if it cannot go now, the READ that follows
+   * carries the tick forward. It never falls back to an identified receipt -- that would tell
+   * the server who wrote to whom, which is the thing sealed sender exists to hide.
+   */
+  private async sendSealedReceipt(
+    conversationId: string,
+    peer: string,
+    state: 'DELIVERED' | 'READ',
+    messageIds: string[],
+  ): Promise<void> {
+    try {
+      const plan = await this.pipeline?.buildSealedReceipt(conversationId, peer, state, messageIds);
+      if (!plan) return;
+      await api.sealedDeliver(plan.recipientUserId, plan.accessKey, plan.peerTargets);
+      await db.messages.where('clientMessageId').anyOf(messageIds).modify((message) => {
+        if (message.receiptSent !== 'READ') message.receiptSent = state;
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'UNIDENTIFIED_ACCESS_DENIED') {
+        await sealedSender.forgetPeerAccessKey(peer);
+      }
+      console.debug('[sealed] receipt not sent', error);
+    }
+  }
+
+  /**
+   * Sends one outbox item sealed, if it can go that way.
+   *
+   * @returns true if sent; false if it must go identified instead
+   * @throws on a failure worth retrying sealed (network, the recipient's devices changed)
+   */
+  private async trySealed(clientMessageId: string): Promise<boolean> {
+    const pipeline = this.requirePipeline();
+    let plan: SealedPlan | null;
+    try {
+      plan = await pipeline.buildSealedPlan(clientMessageId);
+    } catch (error) {
+      // Could not get a certificate or seal: identified still works, and still end-to-end encrypted.
+      console.warn('[sealed] cannot prepare a sealed send; sending identified', error);
+      return false;
+    }
+    if (!plan) return false;
+
+    try {
+      await api.sealedDeliver(plan.recipientUserId, plan.accessKey, plan.peerTargets);
+      if (plan.selfTargets.length > 0) await api.sealedToSelf(plan.selfTargets);
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'UNIDENTIFIED_ACCESS_DENIED') {
+        // Rotated (perhaps because they blocked us) or never valid. Identified from here on,
+        // until their next message carries a key again.
+        await sealedSender.forgetPeerAccessKey(plan.recipientUserId);
+        return false;
+      }
+      if (error instanceof ApiError && error.code === 'DEVICES_CHANGED') pipeline.forgetDeviceCache();
+      throw error;
+    }
+    await pipeline.onSealedSent(clientMessageId);
+    return true;
   }
 
   private async onAck(frame: Envelope<AckPayload>): Promise<void> {
@@ -471,10 +602,27 @@ export class RealtimeService {
       });
   }
 
-  /** Marks everything up to a sequence read, in one frame. */
+  /**
+   * Marks everything up to a sequence read, in one frame. Sealed messages have no sequence and
+   * the server has no record of them, so their READ goes back sealed, listing them by id.
+   */
   async markRead(conversationId: string, uptoSeq: number): Promise<void> {
     realtime.send('/app/receipt', envelope('READ', { conversationId, uptoSeq }));
     await db.conversations.update(conversationId, { unreadCount: 0, lastReadSeq: uptoSeq, markedUnread: false });
+
+    const unreadSealed = await db.messages
+      .where('conversationId')
+      .equals(conversationId)
+      .filter((m) => !!m.sealed && m.senderId !== this.selfUserId && m.receiptSent !== 'READ' && !m.undecryptable)
+      .toArray();
+    if (unreadSealed.length === 0) return;
+    if (!(await readReceiptsEnabled())) {
+      // Nothing to send, but remember we have been through them.
+      await db.messages.bulkUpdate(unreadSealed.map((m) => ({ key: m.clientMessageId, changes: { receiptSent: 'READ' as const } })));
+      return;
+    }
+    const peer = unreadSealed[0].senderId;
+    await this.sendSealedReceipt(conversationId, peer, 'READ', unreadSealed.map((m) => m.clientMessageId));
   }
 
   /**
@@ -537,6 +685,7 @@ export class RealtimeService {
 
       for (const item of pending.filter((entry) => !entry.awaitingUpload && entry.nextAttemptAt <= now)) {
         try {
+          if (await this.trySealed(item.clientMessageId)) continue;
           const plan = await this.pipeline.buildSendPlan(item.clientMessageId);
           if (!plan) {
             await db.outbox.delete(item.clientMessageId);
