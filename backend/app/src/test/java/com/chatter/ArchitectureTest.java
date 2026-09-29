@@ -24,7 +24,7 @@ class ArchitectureTest {
     @Test
     @DisplayName("modules talk to each other only through their api packages")
     void modulesOnlyDependOnApiPackages() {
-        for (String module : new String[]{"auth", "user", "chat", "keys", "presence", "delivery", "account", "media", "notification"}) {
+        for (String module : new String[]{"auth", "user", "chat", "keys", "presence", "delivery", "account", "media", "notification", "sealed"}) {
             ArchRule rule = noClasses()
                     .that().resideOutsideOfPackage("com.chatter." + module + "..")
                     .and().resideInAPackage("com.chatter..")

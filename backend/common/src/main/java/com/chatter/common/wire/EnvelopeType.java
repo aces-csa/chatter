@@ -23,5 +23,7 @@ public enum EnvelopeType {
     /** S to C: ring, someone joined or left, the call ended, or the roster on joining. */
     CALL_EVENT,
     /** Both directions: an encrypted WebRTC offer, answer or ICE candidate for one device. */
-    CALL_SIGNAL
+    CALL_SIGNAL,
+    /** S to C: a sealed-sender envelope. The server does not know who sent it. */
+    SEALED
 }

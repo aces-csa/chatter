@@ -175,6 +175,17 @@ Streaming a 16 MB video through a Spring MVC thread is an excellent way to produ
 
 Every device has its own `device_id` and its own last-acked seq per conversation. A message sent from device A is echoed to devices B and C as a self-message so their local stores converge. Read receipts are per **user**, not per device: the first device to read marks it read for the account and the rest are told.
 
+### DD-11 · Sealed sender for 1:1 messages
+
+End-to-end encryption hides *what* is said; the server still sees *who* sends to whom, and when. Sealed sender removes the sender from that picture for 1:1 chats (Signal's design):
+
+- The sender puts a **server-signed sender certificate** (user, device, identity key, 24 h expiry) and the Signal ciphertext inside an envelope encrypted to the recipient device's identity key (ephemeral X25519 → HKDF → AES-256-GCM).
+- It posts that envelope to an **unauthenticated** endpoint. Instead of a token it presents the recipient's **unidentified access key**, a 16-byte secret shared only inside E2EE messages, so only people the recipient has messaged can use the path.
+- The server stores it per recipient device with **no sender and no conversation**. In a 1:1 chat the conversation id alone names the sender, so a sealed message is filed under no conversation and has no sequence number.
+- The recipient opens the envelope, verifies the certificate, decrypts the inner message, and accepts it only if the certificate's identity key is the one the Signal session with that device is bound to.
+
+Scope and cost: groups and attachments stay identified (a group message names its members; an upload is already tied to its conversation). Receipts for sealed messages travel sealed too. The server can no longer enforce blocking on these messages, so the client drops sealed messages from blocked users and rotates its access key on block, pushing the blocked person back to identified sends. The IP address remains visible; hiding it is a transport concern.
+
 ---
 
 ## 5. Critical Flows

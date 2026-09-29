@@ -15,6 +15,10 @@ public enum ErrorCode {
     NOT_FOUND(404, false),
     KEYS_NOT_REGISTERED(409, false),
     NO_PREKEYS_AVAILABLE(409, true),
+    /** Sealed sender: the unidentified access key does not match the recipient's. Send identified instead. */
+    UNIDENTIFIED_ACCESS_DENIED(401, false),
+    /** The addressed devices are not exactly the recipient's current ones; refresh them and retry. */
+    DEVICES_CHANGED(409, true),
     RATE_LIMITED(429, true),
     STORE_UNAVAILABLE(503, true),
     INTERNAL(500, true);

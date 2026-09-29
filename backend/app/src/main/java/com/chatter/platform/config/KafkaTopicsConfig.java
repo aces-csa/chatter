@@ -18,10 +18,13 @@ public class KafkaTopicsConfig {
     public static final String MESSAGE_CREATED = "message.created";
     public static final String MESSAGE_DELIVERED = "message.delivered";
     public static final String PUSH_NOTIFY = "push.notify";
+    /** Keyed by recipient userId: a sealed message has no conversation the server knows of. */
+    public static final String SEALED_CREATED = "sealed.created";
     public static final String DLT_SUFFIX = ".DLT";
 
     private static final int MESSAGE_CREATED_PARTITIONS = 8;
     private static final int PUSH_NOTIFY_PARTITIONS = 4;
+    private static final int SEALED_CREATED_PARTITIONS = 8;
 
     @Bean
     NewTopic messageCreatedTopic() {
@@ -41,6 +44,16 @@ public class KafkaTopicsConfig {
     @Bean
     NewTopic pushNotifyTopic() {
         return TopicBuilder.name(PUSH_NOTIFY).partitions(PUSH_NOTIFY_PARTITIONS).replicas(1).build();
+    }
+
+    @Bean
+    NewTopic sealedCreatedTopic() {
+        return TopicBuilder.name(SEALED_CREATED).partitions(SEALED_CREATED_PARTITIONS).replicas(1).build();
+    }
+
+    @Bean
+    NewTopic sealedCreatedDeadLetterTopic() {
+        return TopicBuilder.name(SEALED_CREATED + DLT_SUFFIX).partitions(SEALED_CREATED_PARTITIONS).replicas(1).build();
     }
 
     @Bean
